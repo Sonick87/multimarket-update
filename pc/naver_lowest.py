@@ -1,74 +1,100 @@
-"""네이버 최저가 → 멀티마켓 서버 목록 채우기 (PC에서 실행, 표준 라이브러리만).
-사용: python naver_lowest.py <서버주소> <토큰>
-- 사람이 보는 공개 검색 결과 1페이지만, 키워드당 6초 간격으로 가져옵니다(낮은 빈도).
-- 네이버가 막으면(418·403·429 등) 우회하지 않고 즉시 멈추고 이유를 출력합니다."""
-import json, re, sys, time, urllib.request, urllib.error, urllib.parse
+"""네이버 최저가 → 멀티마켓 서버 (PC에서 실행, 표준 라이브러리만)
+- 서버에서 추천 후보 목록을 받아, 비로그인 공개 모바일 쇼핑검색 1페이지를 상품당 1번만 읽습니다.
+- 요청 사이 8~14초 대기, 기본 User-Agent(위장 없음). 403/418/429/503 이나 캡차 안내가 오면 우회하지 않고 즉시 멈춥니다.
+- 값은 도매매번호 기준으로 서버에 올립니다. 최저가가 공급가의 50% 미만이면 같은 상품이 아닐 가능성이 커서 올리지 않습니다.
+사용: python naver_lowest.py  (같은 폴더의 pc_token.txt 를 읽음)"""
+import json, os, random, re, sys, time, urllib.request, urllib.error, urllib.parse
 
-UA = "Mozilla/5.0 (compatible; MultiMarketPC/1.0)"
+SERVER = os.environ.get("MM_SERVER", "https://168-110-41-196.sslip.io")
+NAVER = os.environ.get("NAVER_BASE", "https://m.search.naver.com/search.naver?where=m_shop&query=")
+HERE = os.path.dirname(os.path.abspath(__file__))
+BLOCK = (403, 418, 429, 503)
+GAP = (float(os.environ.get("GAP_MIN", 8)), float(os.environ.get("GAP_MAX", 14)))
+
+def log(*a):
+    line = time.strftime("%Y-%m-%d %H:%M:%S ") + " ".join(str(x) for x in a)
+    print(line, flush=True)
+    try:
+        with open(os.path.join(HERE, "naver_lowest.log"), "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+def query_of(name):
+    """상품명에서 [..] (..) 홍보어를 빼고 앞 5단어"""
+    n = re.sub(r"\[[^\]]*\]|\([^)]*\)|【[^】]*】", " ", name or "")
+    n = re.sub(r"[/·,]+", " ", n)
+    return " ".join(n.split()[:5])
+
+def lowest_from(html):
+    """응답을 "cardType":" 기준으로 잘라 광고(AD)는 빼고 가격 중 최저를 돌려줌. (가격, 상품명) 또는 (0, '')"""
+    best = (0, "")
+    for seg in html.split('"cardType":"')[1:]:
+        if '"sourceType":"AD"' in seg[:3000]:
+            continue
+        m = re.search(r'"discountedSalePrice":"?(\d[\d,]*)"?', seg) or re.search(r'"salePrice":"?(\d[\d,]*)"?', seg)
+        if not m:
+            continue
+        v = int(m.group(1).replace(",", ""))
+        if v < 100:
+            continue
+        nm = re.search(r'"productName":"(.*?)"', seg)
+        if best[0] == 0 or v < best[0]:
+            best = (v, nm.group(1) if nm else "")
+    return best
 
 def get(url, headers=None):
-    req = urllib.request.Request(url, headers=dict({"User-Agent": UA, "Accept-Language": "ko"}, **(headers or {})))
-    with urllib.request.urlopen(req, timeout=20) as r:
+    req = urllib.request.Request(url, headers=dict({"Accept-Language": "ko-KR"}, **(headers or {})))
+    with urllib.request.urlopen(req, timeout=25) as r:
         return r.read().decode("utf-8", "replace")
 
-def prices_from(html):
-    """검색 결과 페이지의 __NEXT_DATA__ JSON 에서 상품 가격(원) 후보를 모음"""
-    m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
-    out = []
-    if m:
-        try:
-            data = json.loads(m.group(1))
-        except Exception:
-            data = None
-        def walk(o):
-            if isinstance(o, dict):
-                for k in ("lowPrice", "price", "mobileLowPrice", "salePrice"):
-                    v = o.get(k)
-                    if isinstance(v, (int, float)) and 100 <= v < 10**8:
-                        out.append(int(v)); break
-                    if isinstance(v, str) and v.replace(",", "").isdigit() and 100 <= int(v.replace(",", "")) < 10**8:
-                        out.append(int(v.replace(",", ""))); break
-                for v in o.values():
-                    walk(v)
-            elif isinstance(o, list):
-                for v in o:
-                    walk(v)
-        if data:
-            walk(data)
-    return out
-
 def main():
-    if len(sys.argv) < 3:
-        print("사용: python naver_lowest.py <서버주소> <토큰>"); return 2
-    server, token = sys.argv[1].rstrip("/"), sys.argv[2]
-    finds = json.loads(get(f"{server}/api/finds", {"X-PC-Token": token}))
-    print(f"후보 {len(finds)}개")
-    mins, seen = {}, {}
-    for f in finds:
-        kw = f["keyword"]
-        if kw in seen:
-            if seen[kw]:
-                mins[f["id"]] = seen[kw]
+    try:
+        token = open(os.path.join(HERE, "pc_token.txt"), encoding="utf-8").read().strip()
+    except Exception:
+        log("pc_token.txt 가 없습니다"); return 2
+    try:
+        items = json.loads(get(SERVER + "/api/finds", {"X-PC-Token": token}))
+    except Exception as ex:
+        log("서버에서 목록을 못 받음:", ex); return 3
+    todo = [i for i in items if not i.get("has") and i.get("key")]
+    log(f"후보 {len(items)}개 중 조회할 것 {len(todo)}개")
+    out, done_q, stop, first = {}, {}, "", True
+    for it in todo:
+        q = query_of(it.get("name") or "")
+        if not q:
             continue
-        url = "https://msearch.shopping.naver.com/search/all?" + urllib.parse.urlencode({"query": kw})
+        if q not in done_q:
+            if not first:
+                time.sleep(random.uniform(*GAP))
+            first = False
+            try:
+                html = get(NAVER + urllib.parse.quote(q))
+            except urllib.error.HTTPError as ex:
+                if ex.code in BLOCK:
+                    stop = f"네이버가 막음 HTTP {ex.code}"; break
+                log("오류", q, ex.code); continue
+            except Exception as ex:
+                log("오류", q, ex); continue
+            if re.search(r"captcha|비정상적인 접근|자동입력 방지", html, re.I) and '"cardType":"' not in html:
+                stop = "네이버 캡차/비정상 접근 안내"; break
+            done_q[q] = lowest_from(html)
+        v, nm = done_q[q]
+        sp = float(it.get("supply") or 0)
+        small = bool(v and sp and v < sp * 0.5)
+        if v and not small:
+            out[str(it["key"])] = v
+        log(q, "→", v or "없음", "(공급가 절반 미만이라 제외)" if small else "")
+    if out:
+        req = urllib.request.Request(SERVER + "/api/mins", data=json.dumps({"mins_by_key": out}).encode("utf-8"),
+                                     headers={"X-PC-Token": token, "Content-Type": "application/json"})
         try:
-            html = get(url)
-        except urllib.error.HTTPError as e:
-            print(f"네이버가 막았습니다: HTTP {e.code} ({kw}). 우회하지 않고 멈춥니다."); break
+            log("서버 응답:", urllib.request.urlopen(req, timeout=30).read().decode("utf-8", "replace"))
         except Exception as ex:
-            print(f"접속 실패: {ex}"); break
-        ps = sorted(prices_from(html))
-        low = ps[0] if ps else 0
-        seen[kw] = low
-        print(f"{kw}: 가격 {len(ps)}개 → 최저 {low}")
-        if low:
-            mins[f["id"]] = low
-        time.sleep(6)
-    if mins:
-        req = urllib.request.Request(f"{server}/api/mins", data=json.dumps({"mins": mins}).encode(), headers={"Content-Type": "application/json", "X-PC-Token": token})
-        print(urllib.request.urlopen(req, timeout=30).read().decode())
-    else:
-        print("채울 최저가가 없습니다(막혔거나 가격을 못 읽음).")
+            log("서버에 올리기 실패:", ex); return 4
+    if stop:
+        log("중단:", stop, "(우회하지 않음)")
+    log(f"끝: 올린 값 {len(out)}개")
     return 0
 
 if __name__ == "__main__":
