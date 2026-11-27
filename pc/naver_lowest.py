@@ -3,8 +3,7 @@
 - 한 번 실행에 소량(기본 8개)만 조회하고, 요청 사이 30~60초 대기합니다. 기본 User-Agent(위장 없음).
 - 403/418/429/503 이나 캡차 안내가 오면 우회하지 않고 즉시 멈추고, 3시간 동안은 네이버에 다시 요청하지 않습니다.
   멈춘 상태와 재시도 시각은 서버 화면에 「네이버 점검 대기」로 표시됩니다.
-- 예약작업은 30분마다 이 파일을 실행하지만, 평소에는 2시간에 한 번만 조회합니다. 서버 화면에서 「지금 조회 요청」을 누르면
-  다음 실행(30분 안)에 바로 한 번 조회합니다. 설치 때 한 번 바로 조회하려면 python naver_lowest.py --now
+- --loop 로 켜 두면 1분마다 서버를 확인하고, 「지금 찾기」(자동 요청)나 「지금 조회 요청」이 있으면 바로 조회합니다. 평소에는 2시간에 한 번만 조회합니다. 설치 때 한 번 바로 조회하려면 python naver_lowest.py --now
 - 이미 조회한 상품(결과 없음 포함)은 24시간 안에는 다시 조회하지 않고, 다음 실행에서 못 한 상품부터 이어서 합니다.
 - 상품명에서 홍보어·수량·단위를 빼고 핵심 단어만 검색어로 쓰며, 결과 중 우리 상품명과 핵심 단어가 충분히 겹치는 것만 최저가로 씁니다.
 - 값은 도매매번호 기준으로 서버에 올립니다. 최저가가 공급가의 50% 미만이면 같은 상품이 아닐 가능성이 커서 올리지 않습니다.
@@ -184,8 +183,8 @@ def main():
     remaining = len([i for i in todo if (st["done"].get(str(i["key"])) or {}).get("t", 0) <= fresh])
     st["last_batch"] = time.time()
     status = {"state": "blocked" if stop else "ok", "t": time.time(), "checked": nq, "found": len(out), "remaining": remaining}
-    if rush:
-        status["rush_done"] = 1   # 서버의 「지금 조회 요청」 표시를 지움
+    if rush and remaining == 0:
+        status["rush_done"] = 1   # 다 조회했을 때만 서버의 「지금 조회 요청」 표시를 지움(남았으면 다음 확인 때 이어서)
     if stop:
         st["blocked_until"] = time.time() + BLOCK_HOURS * 3600
         status["until"] = st["blocked_until"]
@@ -199,5 +198,18 @@ def main():
     log(f"끝: 올린 값 {len(out)}개, 남은 조회 {remaining}개")
     return 0
 
+def loop():
+    """켜 둔 동안 1분마다 서버 요청을 확인해 「지금 찾기」 직후 바로 조회합니다."""
+    log("상주 모드 시작: 1분마다 서버 요청을 확인합니다")
+    while True:
+        try:
+            main()
+        except Exception as ex:
+            log("오류:", ex)
+        time.sleep(float(os.environ.get("LOOP_SECS", 60)))
+
 if __name__ == "__main__":
-    sys.exit(main())
+    if "--loop" in sys.argv:
+        loop()
+    else:
+        sys.exit(main())
