@@ -1,8 +1,10 @@
-"""네이버 최저가 → 멀티마켓 서버 (PC에서 실행, 표준 라이브러리만)
-- 서버에서 추천 후보 목록을 받아, 비로그인 공개 모바일 쇼핑검색 1페이지를 상품당 1번만 읽습니다.
+"""시중 최저가 조회 → 멀티마켓 서버 (PC에서 실행, 표준 라이브러리만)
+- 서버에서 추천 후보 목록을 받아, 상품마다 여러 곳(에누리·네이버·롯데ON)의 비로그인 공개 검색 1페이지를 1번씩 읽고
+  그중 가장 싼 값을 최저가로 올립니다. 어느 곳 값인지(판매처)도 같이 올립니다. 쿠팡·G마켓·SSG·다나와는 이 PC에서도 막혀 있어 제외입니다.
+  (에누리 값은 여러 쇼핑몰 가격을 모은 최저가이고, 네이버 값에는 11번가·G마켓·옥션·롯데ON·SSG 등이 들어 있습니다.)
 - 한 번 실행에 소량(기본 20개)만 조회하고, 요청 사이 15~25초 대기합니다. 기본 User-Agent(위장 없음).
-- 403/418/429/503 이나 캡차 안내가 오면 우회하지 않고 즉시 멈추고, 3시간 동안은 네이버에 다시 요청하지 않습니다.
-  멈춘 상태와 재시도 시각은 서버 화면에 「네이버 점검 대기」로 표시됩니다.
+- 어느 한 곳이 403/418/429/503 이나 캡차 안내를 보내면 우회하지 않고 그 곳만 3시간 쉬고, 나머지 곳으로 계속합니다.
+  모든 곳이 막히면 멈추고, 서버 화면에 「점검 대기」로 표시됩니다.
 - 기본(상주)으로 켜 두면 1분마다 서버를 확인하고, 「지금 찾기」(자동 요청)나 「지금 조회 요청」이 있으면 바로 조회합니다. 평소에는 2시간에 한 번만 조회합니다. 설치 때 한 번 바로 조회하려면 python naver_lowest.py --now
 - 이미 조회한 상품(결과 없음 포함)은 24시간 안에는 다시 조회하지 않고, 다음 실행에서 못 한 상품부터 이어서 합니다.
 - 상품명에서 홍보어·수량·단위를 빼고 핵심 단어만 검색어로 쓰며, 결과 중 우리 상품명과 핵심 단어가 충분히 겹치는 것만 최저가로 씁니다.
@@ -12,6 +14,9 @@ import json, os, random, re, sys, time, urllib.request, urllib.error, urllib.par
 
 SERVER = os.environ.get("MM_SERVER", "https://168-110-41-196.sslip.io")
 NAVER = os.environ.get("NAVER_BASE", "https://m.search.naver.com/search.naver?where=m_shop&query=")
+ENURI = os.environ.get("ENURI_BASE", "https://price.enuri.com/search?keyword=")
+LOTTE = os.environ.get("LOTTE_BASE", "https://www.lotteon.com/search/search/search.ecn?render=search&platform=pc&q=")
+SOURCES = [("enuri", "에누리", ENURI), ("naver", "네이버", NAVER), ("lotteon", "롯데ON", LOTTE)]   # 앞의 것이 같은 값일 때 우선
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATE = os.path.join(HERE, "naver_state.json")
 BLOCK = (403, 418, 429, 503)
@@ -84,6 +89,103 @@ def lowest_from(html, core, supply=0):
             best = (v, name)
     return best[0], best[1], seen, low
 
+def _num(x):
+    try:
+        return int(float(str(x).replace(",", "")))
+    except Exception:
+        return 0
+
+def _walk(o, out):
+    """JSON 안에서 itemListElement 목록을 모두 모음"""
+    if isinstance(o, dict):
+        for k, v in o.items():
+            if k == "itemListElement" and isinstance(v, list):
+                out.extend(v)
+            else:
+                _walk(v, out)
+    elif isinstance(o, list):
+        for v in o:
+            _walk(v, out)
+
+def enuri_lowest(html, core, supply=0):
+    """에누리 검색 결과의 ld+json 상품 목록(상품명, 쇼핑몰 전체 최저가 lowPrice). (가격, 상품명, 본 수, 건너뛴 수)"""
+    best, seen, low = (0, ""), 0, 0
+    for m in re.finditer(r'<script[^>]*application/ld\+json[^>]*>(.*?)</script>', html, re.S | re.I):
+        try:
+            data = json.loads(m.group(1))
+        except Exception:
+            continue
+        els = []
+        _walk(data, els)
+        for el in els:
+            it = el.get("item") if isinstance(el, dict) and isinstance(el.get("item"), dict) else el
+            if not isinstance(it, dict):
+                continue
+            offers = it.get("offers") or {}
+            if isinstance(offers, list):
+                offers = offers[0] if offers and isinstance(offers[0], dict) else {}
+            v = _num(offers.get("lowPrice") or offers.get("price"))
+            if v < 100:
+                continue
+            name = str(it.get("name") or "")
+            seen += 1
+            if not similar(core, name):
+                continue
+            if supply and v < supply * 0.5:
+                low += 1
+                continue
+            if best[0] == 0 or v < best[0]:
+                best = (v, name)
+    return best[0], best[1], seen, low
+
+def lotteon_lowest(html, core, supply=0):
+    """롯데ON 검색 결과 JSON: spdNm(상품명) 뒤의 discountPrice > final_price > price. 광고(cpc)는 뺀다."""
+    best, seen, low = (0, ""), 0, 0
+    for seg in re.split(r'"spdNm"\s*:\s*', html)[1:]:
+        nm = re.match(r'"((?:[^"\\]|\\.)*)"', seg)
+        if not nm:
+            continue
+        chunk = seg[:2500]
+        if re.search(r'"ad"\s*:\s*"cpc"', chunk):
+            continue
+        pm = (re.search(r'"discountPrice"\s*:\s*"?(\d[\d,]*)', chunk) or re.search(r'"final_?[pP]rice"\s*:\s*"?(\d[\d,]*)', chunk)
+              or re.search(r'"price"\s*:\s*"?(\d[\d,]*)', chunk))
+        if not pm:
+            continue
+        v = _num(pm.group(1))
+        if v < 100:
+            continue
+        try:
+            name = json.loads('"' + nm.group(1) + '"')
+        except Exception:
+            name = nm.group(1)
+        seen += 1
+        if not similar(core, name):
+            continue
+        if supply and v < supply * 0.5:
+            low += 1
+            continue
+        if best[0] == 0 or v < best[0]:
+            best = (v, name)
+    return best[0], best[1], seen, low
+
+def parse_source(src, html, core, supply):
+    if src == "enuri":
+        return enuri_lowest(html, core, supply)
+    if src == "lotteon":
+        return lotteon_lowest(html, core, supply)
+    return lowest_from(html, core, supply)
+
+def blocked_page(src, html):
+    """차단·캡차 안내 화면인지(상품 데이터가 없고 안내 문구만 있음)"""
+    if not re.search(r"captcha|비정상적인 접근|자동입력 방지|robot|access denied", html, re.I):
+        return False
+    if src == "naver":
+        return '"cardType":"' not in html
+    if src == "enuri":
+        return "application/ld+json" not in html
+    return '"spdNm"' not in html
+
 def get(url, headers=None):
     return get2(url, headers)[0]
 
@@ -96,10 +198,13 @@ def get2(url, headers=None):
 def load_state():
     try:
         s = json.load(open(STATE, encoding="utf-8"))
-        s.setdefault("done", {}); s.setdefault("blocked_until", 0)
+        s.setdefault("done", {}); s.setdefault("blocked", {})
+        if s.get("blocked_until", 0) > time.time() and "naver" not in s["blocked"]:
+            s["blocked"]["naver"] = s["blocked_until"]   # 옛 형식(네이버만 막힘) 이어받기
+        s.pop("blocked_until", None)
         return s
     except Exception:
-        return {"done": {}, "blocked_until": 0}
+        return {"done": {}, "blocked": {}}
 
 def save_state(s):
     try:
@@ -123,8 +228,11 @@ def main():
         log("pc_token.txt 가 없습니다"); return 2
     st = load_state()
     now = time.time()
-    if st["blocked_until"] > now:
-        log("네이버 점검 대기 중:", hhmm(st["blocked_until"]), "이후에 다시 시도합니다(요청 안 함)")
+    names = {k: n for k, n, _ in SOURCES}
+    def active():
+        return [k for k, _, _ in SOURCES if st["blocked"].get(k, 0) <= time.time()]
+    if not active():
+        log("모든 조회처가 점검 대기 중:", ", ".join(f"{names[k]} {hhmm(st['blocked'][k])}" for k in st["blocked"] if k in names), "이후에 다시 시도합니다(요청 안 함)")
         return 0
     try:
         body, hd = get2(SERVER + "/api/finds", {"X-PC-Token": token})
@@ -146,10 +254,14 @@ def main():
         if (st["done"].get(str(i["key"])) or {}).get("t", 0) > fresh:
             continue   # 24시간 안에 이미 조회함
         todo.append(i)
-    batch, gap = BATCH, GAP   # 오늘 밤 전체를 짧은 간격으로 한 번에 돌렸을 때 16개째에서 캡차로 막혔으므로 소량·긴 간격 유지
-    log(f"후보 {len(items)}개 중 조회할 것 {len(todo)}개 (이번에는 최대 {batch}개)")
-    out, qres, stop, first, nq = {}, {}, "", True, 0
+    # 네이버가 쉬는 중이면 에누리·롯데ON만 쓰므로 조금 더 많이(캡차는 곳마다 따로 보고 막히면 그 곳만 쉼)
+    batch, gap = (BATCH if "naver" in active() else BATCH * 2), GAP
+    log(f"후보 {len(items)}개 중 조회할 것 {len(todo)}개 (이번에는 최대 {batch}개, 조회처: {', '.join(names[k] for k in active())})")
+    out, srcs, qres, first, nq = {}, {}, {}, True, 0   # qres[검색어] = {조회처: html}
+    why_stop = {}
     for it in todo:
+        if not active():
+            break
         q = query_of(it.get("name") or "")
         core = core_words(it.get("name") or "")
         key = str(it["key"])
@@ -163,37 +275,57 @@ def main():
                 time.sleep(random.uniform(*gap))
             first = False
             nq += 1
-            try:
-                html = get(NAVER + urllib.parse.quote(q))
-            except urllib.error.HTTPError as ex:
-                if ex.code in BLOCK:
-                    stop = f"네이버가 막음 HTTP {ex.code}"; break
-                log("오류", q, ex.code); continue
-            except Exception as ex:
-                log("오류", q, ex); continue
-            if re.search(r"captcha|비정상적인 접근|자동입력 방지", html, re.I) and '"cardType":"' not in html:
-                stop = "네이버 캡차/비정상 접근 안내"; break
-            qres[q] = html   # 같은 검색어는 다시 요청하지 않고 이 응답을 재사용
+            qres[q] = {}
+            for k, nmk, base in SOURCES:
+                if k not in active():
+                    continue
+                try:
+                    html = get(base + urllib.parse.quote(q))
+                except urllib.error.HTTPError as ex:
+                    if ex.code in BLOCK:
+                        st["blocked"][k] = time.time() + BLOCK_HOURS * 3600
+                        why_stop[k] = f"{nmk}가 막음 HTTP {ex.code}"
+                        log("중단:", why_stop[k], f"(우회하지 않음) → {hhmm(st['blocked'][k])} 이후에 이 곳만 다시 시도")
+                    else:
+                        log("오류", nmk, q, ex.code)
+                    continue
+                except Exception as ex:
+                    log("오류", nmk, q, ex); continue
+                if blocked_page(k, html):
+                    st["blocked"][k] = time.time() + BLOCK_HOURS * 3600
+                    why_stop[k] = f"{nmk} 캡차/비정상 접근 안내"
+                    log("중단:", why_stop[k], f"(우회하지 않음) → {hhmm(st['blocked'][k])} 이후에 이 곳만 다시 시도")
+                    continue
+                qres[q][k] = html   # 같은 검색어는 다시 요청하지 않고 이 응답을 재사용
+                time.sleep(random.uniform(1, 2))   # 서로 다른 사이트라도 연달아 쏘지 않음
         sp = float(it.get("supply") or 0)
-        v, nm, seen, low = lowest_from(qres[q], core, sp)
+        cands, notes = [], []
+        for k, nmk, _ in SOURCES:
+            if k in qres[q]:
+                v, nm, seen, low = parse_source(k, qres[q][k], core, sp)
+                notes.append(f"{nmk} {v or '없음'}")
+                if v:
+                    cands.append((v, nmk))
+        v, src = min(cands, key=lambda c: c[0]) if cands else (0, "")
+        if not qres[q]:
+            continue   # 이번에 어느 곳도 못 읽음(막힘 등): 조회한 것으로 치지 않고 다음에 다시
         if v:
-            out[key] = v
-        st["done"][key] = {"v": v, "t": time.time(), "q": q}
-        why = "" if v else f"(조건에 맞는 비슷한 상품 없음: 본 {seen}개, 너무 싸서 뺀 {low}개)"
-        log(q, "→", v or "없음", why)
+            out[key] = v; srcs[key] = src
+        st["done"][key] = {"v": v, "t": time.time(), "q": q, "src": src}
+        log(q, "→", f"{v:,}원 ({src})" if v else "없음", "|", ", ".join(notes))
     remaining = len([i for i in todo if (st["done"].get(str(i["key"])) or {}).get("t", 0) <= fresh])
     st["last_batch"] = time.time()
-    status = {"state": "blocked" if stop else "ok", "t": time.time(), "checked": nq, "found": len(out), "remaining": remaining}
+    act = active()
+    status = {"state": "blocked" if not act else "ok", "t": time.time(), "checked": nq, "found": len(out), "remaining": remaining}
+    status["sources"] = [{"name": names[k], "until": st["blocked"].get(k, 0)} for k, _, _ in SOURCES if st["blocked"].get(k, 0) > time.time()]
     if rush and remaining == 0:
         status["rush_done"] = 1   # 다 조회했을 때만 서버의 「지금 조회 요청」 표시를 지움(남았으면 다음 확인 때 이어서)
-    if stop:
-        st["blocked_until"] = time.time() + BLOCK_HOURS * 3600
-        status["until"] = st["blocked_until"]
-        status["why"] = stop
-        log("중단:", stop, f"(우회하지 않음) → {hhmm(st['blocked_until'])} 이후에 이어서 조회")
+    if not act:
+        status["until"] = min(st["blocked"].values())
+        status["why"] = " / ".join(why_stop.values()) or "모든 조회처 점검 대기"
     save_state(st)
     try:
-        log("서버 응답:", post(token, {"mins_by_key": out, "naver_status": status}))
+        log("서버 응답:", post(token, {"mins_by_key": out, "src_by_key": srcs, "naver_status": status}))
     except Exception as ex:
         log("서버에 올리기 실패:", ex); return 4
     log(f"끝: 올린 값 {len(out)}개, 남은 조회 {remaining}개")
