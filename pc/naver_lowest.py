@@ -3,6 +3,8 @@
 - 한 번 실행에 소량(기본 8개)만 조회하고, 요청 사이 30~60초 대기합니다. 기본 User-Agent(위장 없음).
 - 403/418/429/503 이나 캡차 안내가 오면 우회하지 않고 즉시 멈추고, 3시간 동안은 네이버에 다시 요청하지 않습니다.
   멈춘 상태와 재시도 시각은 서버 화면에 「네이버 점검 대기」로 표시됩니다.
+- 예약작업은 30분마다 이 파일을 실행하지만, 평소에는 2시간에 한 번만 조회합니다. 서버 화면에서 「지금 조회 요청」을 누르면
+  다음 실행(30분 안)에 바로 한 번 조회합니다. 설치 때 한 번 바로 조회하려면 python naver_lowest.py --now
 - 이미 조회한 상품(결과 없음 포함)은 24시간 안에는 다시 조회하지 않고, 다음 실행에서 못 한 상품부터 이어서 합니다.
 - 상품명에서 홍보어·수량·단위를 빼고 핵심 단어만 검색어로 쓰며, 결과 중 우리 상품명과 핵심 단어가 충분히 겹치는 것만 최저가로 씁니다.
 - 값은 도매매번호 기준으로 서버에 올립니다. 최저가가 공급가의 50% 미만이면 같은 상품이 아닐 가능성이 커서 올리지 않습니다.
@@ -18,6 +20,7 @@ GAP = (float(os.environ.get("GAP_MIN", 30)), float(os.environ.get("GAP_MAX", 60)
 BATCH = int(os.environ.get("BATCH", 8))                  # 한 번 실행에 조회할 검색어 수
 BLOCK_HOURS = float(os.environ.get("BLOCK_HOURS", 3))    # 막히면 쉬는 시간
 RECHECK_HOURS = float(os.environ.get("RECHECK_HOURS", 24))
+NORMAL_GAP_HOURS = float(os.environ.get("NORMAL_GAP_HOURS", 2))   # 평소 조회 간격(서버가 「지금 조회」를 요청하면 건너뜀)
 PROMO = set("특가 무료배송 사은품 당일발송 당일배송 인기 신상 신상품 최저가 국내 정품 증정 이벤트 할인 대박 추천 hot new best 베스트 단독 한정 행사 무배 쿠폰".split())
 UNIT = re.compile(r"^\d+([.,]\d+)?(개|매|입|p|ea|pcs|set|세트|ml|g|kg|cm|mm|m|l|cc|구|족|장|팩|롤|호|단|색|종)?$", re.I)
 
@@ -83,9 +86,13 @@ def lowest_from(html, core, supply=0):
     return best[0], best[1], seen, low
 
 def get(url, headers=None):
+    return get2(url, headers)[0]
+
+def get2(url, headers=None):
+    """(본문, 응답 헤더)"""
     req = urllib.request.Request(url, headers=dict({"Accept-Language": "ko-KR"}, **(headers or {})))
     with urllib.request.urlopen(req, timeout=25) as r:
-        return r.read().decode("utf-8", "replace")
+        return r.read().decode("utf-8", "replace"), r.headers
 
 def load_state():
     try:
@@ -121,9 +128,17 @@ def main():
         log("네이버 점검 대기 중:", hhmm(st["blocked_until"]), "이후에 다시 시도합니다(요청 안 함)")
         return 0
     try:
-        items = json.loads(get(SERVER + "/api/finds", {"X-PC-Token": token}))
+        body, hd = get2(SERVER + "/api/finds", {"X-PC-Token": token})
+        items = json.loads(body)
     except Exception as ex:
         log("서버에서 목록을 못 받음:", ex); return 3
+    rush = (hd.get("X-Rush") or "") == "1"
+    force = rush or "--now" in sys.argv
+    if not force and now - st.get("last_batch", 0) < NORMAL_GAP_HOURS * 3600 * 0.95:
+        log("다음 조회 시각 전이라 쉽니다:", hhmm(st.get("last_batch", 0) + NORMAL_GAP_HOURS * 3600), "이후(서버에서 「지금 조회 요청」을 누르면 바로 조회)")
+        return 0
+    if rush:
+        log("서버에서 「지금 조회」를 요청했습니다")
     fresh = now - RECHECK_HOURS * 3600
     todo = []
     for i in items:
@@ -167,7 +182,10 @@ def main():
         why = "" if v else f"(조건에 맞는 비슷한 상품 없음: 본 {seen}개, 너무 싸서 뺀 {low}개)"
         log(q, "→", v or "없음", why)
     remaining = len([i for i in todo if (st["done"].get(str(i["key"])) or {}).get("t", 0) <= fresh])
+    st["last_batch"] = time.time()
     status = {"state": "blocked" if stop else "ok", "t": time.time(), "checked": nq, "found": len(out), "remaining": remaining}
+    if rush:
+        status["rush_done"] = 1   # 서버의 「지금 조회 요청」 표시를 지움
     if stop:
         st["blocked_until"] = time.time() + BLOCK_HOURS * 3600
         status["until"] = st["blocked_until"]
