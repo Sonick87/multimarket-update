@@ -22,7 +22,7 @@ set /p TOK=토큰:
 set "PYW=%PY:python.exe=pythonw.exe%"
 if not exist "%PYW%" set "PYW=%PY%"
 schtasks /end /tn "MultiMarket NaverLowest" >nul 2>nul
-schtasks /create /tn "MultiMarket NaverLowest" /tr "\"%PYW%\" -I \"%DIR%\naver_lowest.py\" --loop" /sc onlogon /f
+schtasks /create /tn "MultiMarket NaverLowest" /tr "\"%PYW%\" -I \"%DIR%\naver_lowest.py\"" /sc minute /mo 1 /f
 schtasks /run /tn "MultiMarket NaverLowest"
 echo.
 echo 설치 끝. 지금부터 PC가 켜져 있는 동안 1분마다 서버를 확인해서, 지금 찾기 직후 바로 최저가를 조회합니다 (창은 안 뜹니다).
