@@ -1,6 +1,6 @@
 """네이버 최저가 → 멀티마켓 서버 (PC에서 실행, 표준 라이브러리만)
 - 서버에서 추천 후보 목록을 받아, 비로그인 공개 모바일 쇼핑검색 1페이지를 상품당 1번만 읽습니다.
-- 한 번 실행에 소량(기본 8개)만 조회하고, 요청 사이 15~25초 대기합니다. 기본 User-Agent(위장 없음).
+- 한 번 실행에 소량(기본 20개)만 조회하고, 요청 사이 15~25초 대기합니다. 기본 User-Agent(위장 없음).
 - 403/418/429/503 이나 캡차 안내가 오면 우회하지 않고 즉시 멈추고, 3시간 동안은 네이버에 다시 요청하지 않습니다.
   멈춘 상태와 재시도 시각은 서버 화면에 「네이버 점검 대기」로 표시됩니다.
 - --loop 로 켜 두면 1분마다 서버를 확인하고, 「지금 찾기」(자동 요청)나 「지금 조회 요청」이 있으면 바로 조회합니다. 평소에는 2시간에 한 번만 조회합니다. 설치 때 한 번 바로 조회하려면 python naver_lowest.py --now
@@ -16,7 +16,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 STATE = os.path.join(HERE, "naver_state.json")
 BLOCK = (403, 418, 429, 503)
 GAP = (float(os.environ.get("GAP_MIN", 15)), float(os.environ.get("GAP_MAX", 25)))
-BATCH = int(os.environ.get("BATCH", 8))                  # 평소 한 번 실행에 조회할 검색어 수
+BATCH = int(os.environ.get("BATCH", 20))                  # 평소 한 번 실행에 조회할 검색어 수
 BLOCK_HOURS = float(os.environ.get("BLOCK_HOURS", 3))    # 막히면 쉬는 시간
 RECHECK_HOURS = float(os.environ.get("RECHECK_HOURS", 24))
 NORMAL_GAP_HOURS = float(os.environ.get("NORMAL_GAP_HOURS", 2))   # 평소 조회 간격(서버가 「지금 조회」를 요청하면 건너뜀)
