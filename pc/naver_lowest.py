@@ -2,7 +2,7 @@
 - 서버에서 추천 후보 목록을 받아, 상품마다 여러 곳(에누리·네이버·롯데ON)의 비로그인 공개 검색 1페이지를 1번씩 읽고
   그중 가장 싼 값을 최저가로 올립니다. 어느 곳 값인지(판매처)도 같이 올립니다. 쿠팡·G마켓·SSG·다나와는 이 PC에서도 막혀 있어 제외입니다.
   (에누리 값은 여러 쇼핑몰 가격을 모은 최저가이고, 네이버 값에는 11번가·G마켓·옥션·롯데ON·SSG 등이 들어 있습니다.)
-- 한 번 실행에 소량(기본 20개)만 조회하고, 요청 사이 15~25초 대기합니다. 기본 User-Agent(위장 없음).
+- 상품 사이 3~5초 간격으로 후보 전체를 한 번에 조회합니다. 네이버만 캡차가 잘 떠서 15~25초에 한 번(실행당 최대 20번)만 묻습니다. 기본 User-Agent(위장 없음).
 - 어느 한 곳이 403/418/429/503 이나 캡차 안내를 보내면 우회하지 않고 그 곳만 3시간 쉬고, 나머지 곳으로 계속합니다.
   모든 곳이 막히면 멈추고, 서버 화면에 「점검 대기」로 표시됩니다.
 - 기본(상주)으로 켜 두면 1분마다 서버를 확인하고, 「지금 찾기」(자동 요청)나 「지금 조회 요청」이 있으면 바로 조회합니다. 평소에는 2시간에 한 번만 조회합니다. 설치 때 한 번 바로 조회하려면 python naver_lowest.py --now
@@ -20,8 +20,10 @@ SOURCES = [("enuri", "에누리", ENURI), ("naver", "네이버", NAVER), ("lotte
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATE = os.path.join(HERE, "naver_state.json")
 BLOCK = (403, 418, 429, 503)
-GAP = (float(os.environ.get("GAP_MIN", 15)), float(os.environ.get("GAP_MAX", 25)))
-BATCH = int(os.environ.get("BATCH", 20))                  # 평소 한 번 실행에 조회할 검색어 수
+GAP = (float(os.environ.get("GAP_MIN", 3)), float(os.environ.get("GAP_MAX", 5)))          # 상품 사이 대기(에누리·롯데ON)
+NAVER_GAP = (float(os.environ.get("NAVER_GAP_MIN", 15)), float(os.environ.get("NAVER_GAP_MAX", 25)))   # 네이버는 캡차가 잘 떠서 따로 천천히
+NAVER_MAX = int(os.environ.get("NAVER_MAX", 20))         # 한 번 실행에 네이버 최대 요청 수
+BATCH = int(os.environ.get("BATCH", 150))                 # 한 번 실행에 조회할 검색어 수(사실상 전부)
 BLOCK_HOURS = float(os.environ.get("BLOCK_HOURS", 3))    # 막히면 쉬는 시간
 RECHECK_HOURS = float(os.environ.get("RECHECK_HOURS", 24))
 NORMAL_GAP_HOURS = float(os.environ.get("NORMAL_GAP_HOURS", 2))   # 평소 조회 간격(서버가 「지금 조회」를 요청하면 건너뜀)
@@ -56,12 +58,12 @@ def query_of(name):
     return " ".join(core_words(name))
 
 def similar(core, cand_name):
-    """핵심 단어 중 60% 이상이 후보 상품명에 들어 있으면 같은 종류의 상품으로 본다(띄어쓰기 무시)"""
+    """핵심 단어 중 40% 이상(최소 1개, 핵심 단어가 3개 이상이면 2개)이 후보 상품명에 들어 있으면 비슷한 상품으로 본다(띄어쓰기 무시)"""
     if not core:
         return False
     c = re.sub(r"\s+", "", cand_name or "").lower()
     hit = sum(1 for w in core if w.lower() in c)
-    need = max(1, -(-len(core) * 6 // 10))   # 올림
+    need = max(2 if len(core) >= 3 else 1, -(-len(core) * 4 // 10))   # 올림
     return hit >= need
 
 def lowest_from(html, core, supply=0):
@@ -255,7 +257,8 @@ def main():
             continue   # 24시간 안에 이미 조회함
         todo.append(i)
     # 네이버가 쉬는 중이면 에누리·롯데ON만 쓰므로 조금 더 많이(캡차는 곳마다 따로 보고 막히면 그 곳만 쉼)
-    batch, gap = (BATCH if "naver" in active() else BATCH * 2), GAP
+    batch, gap = BATCH, GAP
+    naver_n, naver_last = 0, 0.0
     log(f"후보 {len(items)}개 중 조회할 것 {len(todo)}개 (이번에는 최대 {batch}개, 조회처: {', '.join(names[k] for k in active())})")
     out, srcs, qres, first, nq = {}, {}, {}, True, 0   # qres[검색어] = {조회처: html}
     why_stop = {}
@@ -279,6 +282,10 @@ def main():
             for k, nmk, base in SOURCES:
                 if k not in active():
                     continue
+                if k == "naver":   # 네이버는 15~25초에 한 번, 한 번 실행에 최대 NAVER_MAX번만(나머지 상품은 에누리·롯데ON 값으로)
+                    if naver_n >= NAVER_MAX or time.time() - naver_last < random.uniform(*NAVER_GAP):
+                        continue
+                    naver_n += 1; naver_last = time.time()
                 try:
                     html = get(base + urllib.parse.quote(q))
                 except urllib.error.HTTPError as ex:
@@ -297,7 +304,7 @@ def main():
                     log("중단:", why_stop[k], f"(우회하지 않음) → {hhmm(st['blocked'][k])} 이후에 이 곳만 다시 시도")
                     continue
                 qres[q][k] = html   # 같은 검색어는 다시 요청하지 않고 이 응답을 재사용
-                time.sleep(random.uniform(1, 2))   # 서로 다른 사이트라도 연달아 쏘지 않음
+                time.sleep(random.uniform(0.5, 1))   # 서로 다른 사이트라도 연달아 쏘지 않음
         sp = float(it.get("supply") or 0)
         cands, notes = [], []
         for k, nmk, _ in SOURCES:
